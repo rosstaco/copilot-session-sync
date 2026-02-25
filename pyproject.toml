@@ -1,0 +1,17 @@
+[project]
+name = "copilot-session-sync"
+version = "0.1.0"
+description = "Sync Copilot CLI sessions from devcontainers to your host machine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["rich>=13.0"]
+
+[project.scripts]
+copilot-session-sync = "copilot_session_sync.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
