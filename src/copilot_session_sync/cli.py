@@ -15,6 +15,7 @@ from rich.text import Text
 from .parser import ParsedSession, parse_session_dir
 from .scanner import ScanResult, check_docker_available, list_containers, _discover_home_dirs, _run
 from .store import DEFAULT_COPILOT_DIR, diff_sessions, get_existing_session_ids, merge_sessions
+from .vscode import scan_vscode_workspaces
 
 console = Console()
 
@@ -81,39 +82,74 @@ def _print_scan_summary(
     containers_scanned: int,
     containers_with_data: int,
     errors: list[str],
+    *,
+    vscode_new: list[ParsedSession] | None = None,
+    vscode_existing: list[ParsedSession] | None = None,
+    vscode_workspaces: int = 0,
 ) -> None:
     """Print a rich summary of what was found."""
     console.print()
-    console.print(f"[bold]Scanned {containers_scanned} containers[/bold], "
-                  f"[green]{containers_with_data}[/green] had Copilot data")
+    if containers_scanned:
+        console.print(f"[bold]Scanned {containers_scanned} containers[/bold], "
+                      f"[green]{containers_with_data}[/green] had Copilot data")
+    if vscode_workspaces:
+        vscode_total = len(vscode_new or []) + len(vscode_existing or [])
+        console.print(f"[bold]Scanned {vscode_workspaces} VS Code workspaces[/bold], "
+                      f"[green]{vscode_total}[/green] chat sessions found")
     console.print()
 
-    if not new_sessions:
+    all_new = list(new_sessions)
+    if vscode_new:
+        all_new.extend(vscode_new)
+
+    if not all_new:
         console.print("[yellow]No new sessions to sync.[/yellow] Everything is up to date! ✨")
         return
 
-    table = Table(title=f"🆕 {len(new_sessions)} New Sessions to Sync", show_lines=True)
-    table.add_column("Summary", style="bold", max_width=50)
-    table.add_column("Working Dir", style="dim", max_width=40)
-    table.add_column("Turns", justify="right", style="cyan")
-    table.add_column("Container", style="magenta")
-    table.add_column("Date", style="dim")
+    # Container sessions table
+    if new_sessions:
+        table = Table(title=f"🐳 {len(new_sessions)} Container Sessions", show_lines=True)
+        table.add_column("Summary", style="bold", max_width=50)
+        table.add_column("Working Dir", style="dim", max_width=40)
+        table.add_column("Turns", justify="right", style="cyan")
+        table.add_column("Container", style="magenta")
+        table.add_column("Date", style="dim")
 
-    for session in sorted(new_sessions, key=lambda s: s.meta.created_at or ""):
-        summary = session.meta.summary or "[dim]no summary[/dim]"
-        cwd = session.meta.cwd or ""
-        # Shorten container paths
-        if cwd.startswith("/workspaces/"):
-            cwd = cwd[len("/workspaces/"):]
-        turns = str(len(session.turns)) if session.turns else "[dim]0[/dim]"
-        date = (session.meta.created_at or "")[:10]
-        table.add_row(summary, cwd, turns, session.source_container, date)
+        for session in sorted(new_sessions, key=lambda s: s.meta.created_at or ""):
+            summary = session.meta.summary or "[dim]no summary[/dim]"
+            cwd = session.meta.cwd or ""
+            if cwd.startswith("/workspaces/"):
+                cwd = cwd[len("/workspaces/"):]
+            turns = str(len(session.turns)) if session.turns else "[dim]0[/dim]"
+            date = (session.meta.created_at or "")[:10]
+            table.add_row(summary, cwd, turns, session.source_container, date)
 
-    console.print(table)
+        console.print(table)
 
-    if existing_sessions:
+    # VS Code sessions table
+    if vscode_new:
+        console.print()
+        table = Table(title=f"💬 {len(vscode_new)} VS Code Chat Sessions", show_lines=True)
+        table.add_column("Title", style="bold", max_width=50)
+        table.add_column("Workspace", style="dim", max_width=40)
+        table.add_column("Turns", justify="right", style="cyan")
+        table.add_column("Source", style="magenta")
+        table.add_column("Date", style="dim")
+
+        for session in sorted(vscode_new, key=lambda s: s.meta.created_at or ""):
+            summary = session.meta.summary or "[dim]untitled[/dim]"
+            cwd = session.meta.cwd or ""
+            turns = str(len(session.turns)) if session.turns else "[dim]0[/dim]"
+            source = session.source_container.replace("vscode:", "")
+            date = (session.meta.created_at or "")[:10]
+            table.add_row(summary, cwd, turns, source, date)
+
+        console.print(table)
+
+    all_existing = len(existing_sessions) + len(vscode_existing or [])
+    if all_existing:
         console.print(
-            f"\n[dim]{len(existing_sessions)} sessions already synced (skipped)[/dim]"
+            f"\n[dim]{all_existing} sessions already synced (skipped)[/dim]"
         )
 
     if errors:
@@ -128,13 +164,8 @@ def main() -> None:
     """Main entry point for copilot-session-sync."""
     console.print()
     console.print("[bold cyan]🔄 copilot-session-sync[/bold cyan]")
-    console.print("[dim]Consolidate Copilot CLI sessions from devcontainers to your host[/dim]")
+    console.print("[dim]Consolidate Copilot sessions from devcontainers and VS Code to your host[/dim]")
     console.print()
-
-    # Preflight checks
-    if not check_docker_available():
-        console.print("[bold red]Error:[/bold red] Docker is not running or not installed.")
-        sys.exit(1)
 
     copilot_dir = DEFAULT_COPILOT_DIR
     db_path = copilot_dir / "session-store.db"
@@ -143,54 +174,81 @@ def main() -> None:
         console.print("Run Copilot CLI at least once on this host first.")
         sys.exit(1)
 
-    # Scan
-    with tempfile.TemporaryDirectory(prefix="copilot-sync-") as tmpdir:
-        staging = Path(tmpdir)
+    existing_ids = get_existing_session_ids(db_path)
+
+    # Phase 1: Scan Docker containers
+    docker_available = check_docker_available()
+    container_new: list[ParsedSession] = []
+    container_existing: list[ParsedSession] = []
+    source_dirs: dict[str, Path] = {}
+    total_containers = 0
+    containers_with_data = 0
+    errors: list[str] = []
+
+    tmpdir_obj = tempfile.TemporaryDirectory(prefix="copilot-sync-")
+    staging = Path(tmpdir_obj.name)
+
+    if docker_available:
         sessions, source_dirs, total_containers, containers_with_data, errors = (
             _extract_all_sessions(staging)
         )
+        container_new, container_existing = diff_sessions(sessions, existing_ids)
+    else:
+        console.print("[dim]Docker not available, skipping container scan.[/dim]")
 
-        if not sessions:
-            console.print("[yellow]No Copilot sessions found in any container.[/yellow]")
-            sys.exit(0)
+    # Phase 2: Scan VS Code workspaces
+    vscode_new: list[ParsedSession] = []
+    vscode_existing: list[ParsedSession] = []
+    vscode_workspace_count = 0
 
-        # Diff against existing
-        existing_ids = get_existing_session_ids(db_path)
-        new_sessions, existing_sessions = diff_sessions(sessions, existing_ids)
+    with console.status("[bold cyan]Scanning VS Code workspaces..."):
+        workspaces = scan_vscode_workspaces()
+        vscode_workspace_count = len(workspaces)
+        all_vscode_sessions = [s for ws in workspaces for s in ws.sessions]
+        vscode_new, vscode_existing = diff_sessions(all_vscode_sessions, existing_ids)
 
-        # Present
-        _print_scan_summary(
-            new_sessions, existing_sessions, total_containers, containers_with_data, errors
+    # Present combined results
+    _print_scan_summary(
+        container_new, container_existing,
+        total_containers, containers_with_data, errors,
+        vscode_new=vscode_new,
+        vscode_existing=vscode_existing,
+        vscode_workspaces=vscode_workspace_count,
+    )
+
+    all_new = container_new + vscode_new
+    if not all_new:
+        tmpdir_obj.cleanup()
+        sys.exit(0)
+
+    # Confirm
+    console.print()
+    total_turns = sum(len(s.turns) for s in all_new)
+    console.print(
+        f"Will import [bold green]{len(all_new)}[/bold green] sessions "
+        f"([cyan]{total_turns}[/cyan] conversation turns) into host session store."
+    )
+    if not Confirm.ask("\n[bold]Proceed with sync?[/bold]", default=True):
+        console.print("[dim]Cancelled.[/dim]")
+        tmpdir_obj.cleanup()
+        sys.exit(0)
+
+    # Sync
+    console.print()
+    with console.status("[bold cyan]Syncing sessions..."):
+        stats = merge_sessions(
+            all_new, copilot_dir=copilot_dir, source_dirs=source_dirs
         )
 
-        if not new_sessions:
-            sys.exit(0)
+    tmpdir_obj.cleanup()
 
-        # Confirm
-        console.print()
-        total_turns = sum(len(s.turns) for s in new_sessions)
-        console.print(
-            f"Will import [bold green]{len(new_sessions)}[/bold green] sessions "
-            f"([cyan]{total_turns}[/cyan] conversation turns) into host session store."
-        )
-        if not Confirm.ask("\n[bold]Proceed with sync?[/bold]", default=True):
-            console.print("[dim]Cancelled.[/dim]")
-            sys.exit(0)
-
-        # Sync
-        console.print()
-        with console.status("[bold cyan]Syncing sessions...") as status:
-            stats = merge_sessions(
-                new_sessions, copilot_dir=copilot_dir, source_dirs=source_dirs
-            )
-
-        # Report
-        console.print()
-        console.print("[bold green]✅ Sync complete![/bold green]")
-        console.print(f"  Sessions imported: [bold]{stats.sessions_imported}[/bold]")
-        console.print(f"  Turns indexed:     [bold]{stats.turns_imported}[/bold]")
-        if stats.sessions_skipped:
-            console.print(f"  Skipped (dupes):   [dim]{stats.sessions_skipped}[/dim]")
-        if stats.backup_path:
-            console.print(f"  Backup:            [dim]{stats.backup_path}[/dim]")
-        console.print()
+    # Report
+    console.print()
+    console.print("[bold green]✅ Sync complete![/bold green]")
+    console.print(f"  Sessions imported: [bold]{stats.sessions_imported}[/bold]")
+    console.print(f"  Turns indexed:     [bold]{stats.turns_imported}[/bold]")
+    if stats.sessions_skipped:
+        console.print(f"  Skipped (dupes):   [dim]{stats.sessions_skipped}[/dim]")
+    if stats.backup_path:
+        console.print(f"  Backup:            [dim]{stats.backup_path}[/dim]")
+    console.print()
