@@ -126,25 +126,36 @@ def _print_scan_summary(
 
         console.print(table)
 
-    # VS Code sessions table
+    # VS Code sessions — grouped by workspace
     if vscode_new:
         console.print()
-        table = Table(title=f"💬 {len(vscode_new)} VS Code Chat Sessions", show_lines=True)
-        table.add_column("Title", style="bold", max_width=50)
-        table.add_column("Workspace", style="dim", max_width=40)
-        table.add_column("Turns", justify="right", style="cyan")
-        table.add_column("Source", style="magenta")
-        table.add_column("Date", style="dim")
 
-        for session in sorted(vscode_new, key=lambda s: s.meta.created_at or ""):
-            summary = session.meta.summary or "[dim]untitled[/dim]"
-            cwd = session.meta.cwd or ""
-            turns = str(len(session.turns)) if session.turns else "[dim]0[/dim]"
-            source = session.source_container.replace("vscode:", "")
-            date = (session.meta.created_at or "")[:10]
-            table.add_row(summary, cwd, turns, source, date)
+        # Group sessions by workspace
+        by_workspace: dict[str, list[ParsedSession]] = {}
+        for session in vscode_new:
+            ws = session.source_container.replace("vscode:", "")
+            by_workspace.setdefault(ws, []).append(session)
 
-        console.print(table)
+        from rich.tree import Tree
+        from rich.panel import Panel
+
+        tree = Tree(f"[bold]💬 {len(vscode_new)} VS Code Chat Sessions[/bold] across {len(by_workspace)} workspaces")
+
+        for ws_name in sorted(by_workspace.keys()):
+            sessions = by_workspace[ws_name]
+            total_turns = sum(len(s.turns) for s in sessions)
+            branch = tree.add(
+                f"[bold magenta]{ws_name}[/bold magenta]  "
+                f"[dim]({len(sessions)} chats, {total_turns} turns)[/dim]"
+            )
+            for session in sorted(sessions, key=lambda s: s.meta.created_at or ""):
+                title = session.meta.summary or "[dim]untitled[/dim]"
+                turns = len(session.turns)
+                date = (session.meta.created_at or "")[:10]
+                date_str = f"  [dim]{date}[/dim]" if date else ""
+                branch.add(f"{title}  [cyan]{turns}t[/cyan]{date_str}")
+
+        console.print(tree)
 
     all_existing = len(existing_sessions) + len(vscode_existing or [])
     if all_existing:
